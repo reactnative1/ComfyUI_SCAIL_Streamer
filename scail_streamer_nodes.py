@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import glob
 import subprocess
 import shutil
 import numpy as np
@@ -24,7 +25,6 @@ except ImportError:
 
 
 def get_ffmpeg_path():
-    """Locate the ffmpeg executable on Windows, Linux, or within ComfyUI portable environment."""
     exe = shutil.which("ffmpeg")
     if exe:
         return exe
@@ -89,6 +89,71 @@ def reinhard_color_transfer_np(target_rgb, ref_rgb):
     return res_rgb
 
 
+def compile_frames_to_video(frames_dir, output_mp4, fps=24.0, audio_path=None):
+    frames_dir_clean = os.path.abspath(frames_dir).replace("\\", "/")
+    output_mp4_clean = os.path.abspath(output_mp4).replace("\\", "/")
+    input_pattern = f"{frames_dir_clean}/frame_%06d.png"
+    ffmpeg_exe = get_ffmpeg_path()
+
+    ffmpeg_cmd = [
+        ffmpeg_exe, "-y",
+        "-framerate", str(fps),
+        "-i", input_pattern,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+    ]
+
+    has_audio = False
+    if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024:
+        audio_clean = os.path.abspath(audio_path).replace("\\", "/")
+        ffmpeg_cmd.extend(["-i", audio_clean, "-c:a", "aac", "-b:a", "192k", "-shortest"])
+        has_audio = True
+
+    ffmpeg_cmd.append(output_mp4_clean)
+
+    try:
+        proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode == 0 and os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 1000:
+            msg = f"SUCCESS! Stitched via FFmpeg to {output_mp4}" + (" (with audio)" if has_audio else "")
+            print(f"[SCAIL_DiskVideoCollector] {msg}")
+            return True, msg
+        else:
+            err_lines = proc.stderr.strip().splitlines()[-3:] if proc.stderr else []
+            err_detail = " | ".join(err_lines)
+            print(f"[SCAIL_DiskVideoCollector] FFmpeg exited ({proc.returncode}): {err_detail}. Falling back to OpenCV...")
+    except Exception as e:
+        print(f"[SCAIL_DiskVideoCollector] FFmpeg execution issue: {e}. Falling back to OpenCV...")
+
+    # Fallback: OpenCV VideoWriter (Runs 100% in Python, immune to Windows shell path escaping)
+    frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
+    if not frame_files:
+        return False, "No frame PNG files found in temp_frames to compile."
+
+    try:
+        first_frame = cv2.imread(frame_files[0])
+        h, w, _ = first_frame.shape
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_mp4, fourcc, float(fps), (w, h))
+
+        for ff in frame_files:
+            img = cv2.imread(ff)
+            if img is not None:
+                writer.write(img)
+        writer.release()
+
+        if os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 1000:
+            msg = f"SUCCESS! Stitched via OpenCV fallback to {output_mp4}"
+            print(f"[SCAIL_DiskVideoCollector] {msg}")
+            return True, msg
+    except Exception as e:
+        print(f"[SCAIL_DiskVideoCollector] OpenCV fallback also failed: {e}")
+
+    return False, "Failed to compile video with both FFmpeg and OpenCV."
+
+
 # =====================================================================
 # Node 1: SCAIL_VideoChunkIterator
 # =====================================================================
@@ -97,7 +162,7 @@ class SCAIL_VideoChunkIterator:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE", {"tooltip": "The complete source video frames."}),
+                "images": ("IMAGE", {"tooltip": "The complete source video frames from LoadVideo / GetVideoComponents."}),
                 "output_folder": ("STRING", {
                     "default": "scail_project",
                     "multiline": False,
@@ -155,7 +220,7 @@ class SCAIL_VideoChunkIterator:
             if os.path.exists(frames_dir):
                 shutil.rmtree(frames_dir)
             os.makedirs(frames_dir, exist_ok=True)
-            for cache_f in ["previous_frames.npy", "last_exit_frame.npy", "manifest.json"]:
+            for cache_f in ["previous_frames.npy", "last_exit_frame.npy", "manifest.json", "audio.wav"]:
                 cp = os.path.join(cache_dir, cache_f)
                 if os.path.exists(cp):
                     os.remove(cp)
@@ -214,7 +279,7 @@ class SCAIL_VideoChunkIterator:
                 "last_processed": current_index
             }, f)
 
-        print(f"[SCAIL_VideoChunkIterator] Processing Segment {current_index + 1}/{total_segments}. Is Last: {is_last_segment}")
+        print(f"[SCAIL_VideoChunkIterator] Processing Segment {current_index + 1}/{total_segments} (Frames {start_frame}..{end_frame}). Is Last: {is_last_segment}")
 
         return (
             pose_chunk, previous_frames, current_index, total_segments,
@@ -237,7 +302,7 @@ class SCAIL_DiskVideoCollector:
                 "is_last_segment": ("BOOLEAN", {"default": False}),
                 "overlap_count": ("INT", {"default": 5, "min": 1, "max": 32, "step": 1}),
                 "apply_color_transfer": ("BOOLEAN", {"default": True}),
-                "save_video_every_segment": ("BOOLEAN", {"default": True, "tooltip": "Compile MP4 after each segment so you can preview progress immediately."}),
+                "save_video_every_segment": ("BOOLEAN", {"default": True, "tooltip": "Compile MP4 after every segment so you can preview progress immediately."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.1}),
                 "output_filename": ("STRING", {"default": "final_scail_video.mp4"}),
                 "cleanup_temp_frames": ("BOOLEAN", {"default": False}),
@@ -320,60 +385,39 @@ class SCAIL_DiskVideoCollector:
                 "last_segment_saved": segment_index
             }, f)
 
-        final_video_path = ""
+        final_video_path = os.path.join(base_dir, output_filename)
         status = f"Saved segment {segment_index} ({keep_frames.shape[0]} frames). Total frames on disk: {current_frame_counter}."
         print(f"[SCAIL_DiskVideoCollector] {status}")
 
-        should_compile = is_last_segment or save_video_every_segment
-        if should_compile and current_frame_counter > 0:
-            final_video_path = os.path.join(base_dir, output_filename)
-            input_pattern = os.path.join(frames_dir, "frame_%06d.png")
-            ffmpeg_exe = get_ffmpeg_path()
-
-            ffmpeg_cmd = [
-                ffmpeg_exe, "-y",
-                "-framerate", str(fps),
-                "-i", input_pattern,
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",
-                "-pix_fmt", "yuv420p"
-            ]
-
-            temp_audio_path = os.path.join(cache_dir, "audio.wav")
-            has_audio = False
-            if audio is not None and isinstance(audio, dict) and "waveform" in audio:
-                try:
+        temp_audio_path = os.path.join(cache_dir, "audio.wav")
+        if audio is not None and isinstance(audio, dict) and "waveform" in audio:
+            try:
+                wf = audio["waveform"]
+                if wf.numel() > 0:
                     import torchaudio
                     torchaudio.save(
                         temp_audio_path,
-                        audio["waveform"].squeeze(0).cpu(),
+                        wf.squeeze(0).cpu(),
                         audio.get("sample_rate", 44100)
                     )
-                    ffmpeg_cmd.extend(["-i", temp_audio_path, "-c:a", "aac", "-b:a", "192k", "-shortest"])
-                    has_audio = True
-                except Exception as e:
-                    print(f"[SCAIL_DiskVideoCollector] Audio export warning: {e}")
-
-            ffmpeg_cmd.append(final_video_path)
-
-            try:
-                proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if proc.returncode == 0:
-                    status = f"SUCCESS! Stitched {current_frame_counter} frames to {final_video_path}"
-                    print(f"[SCAIL_DiskVideoCollector] {status}")
-                    if is_last_segment and cleanup_temp_frames and os.path.exists(frames_dir):
-                        try:
-                            shutil.rmtree(frames_dir)
-                            status += " (Cleaned temporary frames)"
-                        except Exception:
-                            pass
-                else:
-                    status = f"FFmpeg error: {proc.stderr[:200]}"
-                    print(f"[SCAIL_DiskVideoCollector] {status}")
             except Exception as e:
-                status = f"Failed to execute FFmpeg ({ffmpeg_exe}): {e}"
-                print(f"[SCAIL_DiskVideoCollector] {status}")
+                print(f"[SCAIL_DiskVideoCollector] Audio save warning: {e}")
+
+        should_compile = is_last_segment or save_video_every_segment
+        if should_compile and current_frame_counter > 0:
+            ok, comp_status = compile_frames_to_video(
+                frames_dir=frames_dir,
+                output_mp4=final_video_path,
+                fps=fps,
+                audio_path=temp_audio_path if os.path.exists(temp_audio_path) else None
+            )
+            status = comp_status
+            if ok and is_last_segment and cleanup_temp_frames and os.path.exists(frames_dir):
+                try:
+                    shutil.rmtree(frames_dir)
+                    status += " (Cleaned temporary frames)"
+                except Exception:
+                    pass
 
         cached_tensor = numpy_to_tensor(overlap_frames)
         return (cached_tensor, final_video_path, status)
