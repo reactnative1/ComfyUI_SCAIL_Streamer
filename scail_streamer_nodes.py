@@ -95,20 +95,15 @@ def compile_frames_to_video(frames_dir, output_mp4, fps=24.0, audio_path=None):
     input_pattern = f"{frames_dir_clean}/frame_%06d.png"
     ffmpeg_exe = get_ffmpeg_path()
 
-    # 1. Start with global options
     ffmpeg_cmd = [ffmpeg_exe, "-y"]
-
-    # 2. Add video frames input
     ffmpeg_cmd.extend(["-framerate", str(fps), "-i", input_pattern])
 
-    # 3. Add audio input if valid (MUST come before output options)
     has_audio = False
     if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024:
         audio_clean = os.path.abspath(audio_path).replace("\\", "/")
         ffmpeg_cmd.extend(["-i", audio_clean])
         has_audio = True
 
-    # 4. Output encoding options (strictly after all -i inputs)
     ffmpeg_cmd.extend([
         "-c:v", "libx264",
         "-preset", "medium",
@@ -120,7 +115,6 @@ def compile_frames_to_video(frames_dir, output_mp4, fps=24.0, audio_path=None):
     if has_audio:
         ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
 
-    # 5. Output file
     ffmpeg_cmd.append(output_mp4_clean)
 
     try:
@@ -136,7 +130,6 @@ def compile_frames_to_video(frames_dir, output_mp4, fps=24.0, audio_path=None):
     except Exception as e:
         print(f"[SCAIL_DiskVideoCollector] FFmpeg execution issue: {e}. Falling back to imageio...")
 
-    # Fallback to imageio
     frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
     if not frame_files:
         return False, "No frame PNG files found in temp_frames to compile."
@@ -304,7 +297,6 @@ class SCAIL_DiskVideoCollector:
                 "is_last_segment": ("BOOLEAN", {"default": False}),
                 "overlap_count": ("INT", {"default": 5, "min": 1, "max": 32, "step": 1}),
                 "apply_color_transfer": ("BOOLEAN", {"default": True}),
-                "save_video_every_segment": ("BOOLEAN", {"default": True, "tooltip": "Compile MP4 after every segment so you can preview progress immediately."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.1}),
                 "output_filename": ("STRING", {"default": "final_scail_video.mp4"}),
                 "cleanup_temp_frames": ("BOOLEAN", {"default": False}),
@@ -322,14 +314,24 @@ class SCAIL_DiskVideoCollector:
 
     def collect_and_save(
         self, generated_images, output_folder, segment_index, is_last_segment,
-        overlap_count, apply_color_transfer, save_video_every_segment, fps,
-        output_filename, cleanup_temp_frames=False, audio=None
+        overlap_count, apply_color_transfer, fps=24.0, output_filename="final_scail_video.mp4",
+        cleanup_temp_frames=False, audio=None, **kwargs
     ):
         base_dir = resolve_project_path(output_folder)
         frames_dir = os.path.join(base_dir, "temp_frames")
         cache_dir = os.path.join(base_dir, "cache")
         os.makedirs(frames_dir, exist_ok=True)
         os.makedirs(cache_dir, exist_ok=True)
+
+        if not isinstance(output_filename, str) or not output_filename.lower().endswith(".mp4"):
+            output_filename = "final_scail_video.mp4"
+
+        try:
+            fps = float(fps)
+            if fps <= 0:
+                fps = 24.0
+        except (ValueError, TypeError):
+            fps = 24.0
 
         ref_frame_path = os.path.join(cache_dir, "last_exit_frame.npy")
         prev_frames_path = os.path.join(cache_dir, "previous_frames.npy")
@@ -405,8 +407,7 @@ class SCAIL_DiskVideoCollector:
             except Exception as e:
                 print(f"[SCAIL_DiskVideoCollector] Audio save warning: {e}")
 
-        should_compile = is_last_segment or save_video_every_segment
-        if should_compile and current_frame_counter > 0:
+        if current_frame_counter > 0:
             ok, comp_status = compile_frames_to_video(
                 frames_dir=frames_dir,
                 output_mp4=final_video_path,
