@@ -2,6 +2,7 @@ import os
 import json
 import math
 import glob
+import hashlib
 import subprocess
 import shutil
 import numpy as np
@@ -65,6 +66,19 @@ def numpy_to_tensor(array):
     if torch is not None:
         return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
     return array
+
+
+def get_video_fingerprint(images):
+    total_frames = images.shape[0]
+    h, w = images.shape[1], images.shape[2]
+    if torch is not None and isinstance(images, torch.Tensor):
+        s1 = images[0, ::16, ::16, 0].cpu().numpy().tobytes()
+        s2 = images[-1, ::16, ::16, 0].cpu().numpy().tobytes()
+    else:
+        s1 = images[0, ::16, ::16, 0].tobytes()
+        s2 = images[-1, ::16, ::16, 0].tobytes()
+    h_str = hashlib.md5(s1 + s2).hexdigest()[:8]
+    return f"{total_frames}f_{w}x{h}_{h_str}"
 
 
 def reinhard_color_transfer_np(target_rgb, ref_rgb):
@@ -185,7 +199,6 @@ class SCAIL_VideoChunkIterator:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # Force ComfyUI to re-execute this node on every queue prompt
         return float("NaN")
 
     def iterate_chunk(self, images, output_folder, frame_length, overlap_count, mode, manual_segment_index, fps=24.0, audio=None):
@@ -212,11 +225,29 @@ class SCAIL_VideoChunkIterator:
         os.makedirs(frames_dir, exist_ok=True)
 
         state_file = os.path.join(cache_dir, "iterator_state.json")
+        current_fingerprint = get_video_fingerprint(images)
 
-        if mode == "Reset Session State":
+        stored_state = {}
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r") as f:
+                    stored_state = json.load(f)
+            except Exception:
+                stored_state = {}
+
+        stored_fingerprint = stored_state.get("video_fingerprint")
+        is_new_video = (stored_fingerprint is not None and stored_fingerprint != current_fingerprint)
+
+        if mode == "Reset Session State" or is_new_video:
+            if is_new_video:
+                print(f"[SCAIL_VideoChunkIterator] New driving video detected! Automatically resetting session for '{output_folder}'.")
             current_index = 0
             with open(state_file, "w") as f:
-                json.dump({"current_index": 0, "total_segments": total_segments}, f)
+                json.dump({
+                    "current_index": 0,
+                    "total_segments": total_segments,
+                    "video_fingerprint": current_fingerprint
+                }, f)
             if os.path.exists(frames_dir):
                 shutil.rmtree(frames_dir)
             os.makedirs(frames_dir, exist_ok=True)
@@ -227,15 +258,7 @@ class SCAIL_VideoChunkIterator:
         elif mode == "Manual Segment Index":
             current_index = manual_segment_index
         else:
-            if os.path.exists(state_file):
-                try:
-                    with open(state_file, "r") as f:
-                        state_data = json.load(f)
-                    current_index = state_data.get("current_index", 0)
-                except Exception:
-                    current_index = 0
-            else:
-                current_index = 0
+            current_index = stored_state.get("current_index", 0)
 
         if current_index >= total_segments:
             current_index = total_segments - 1
@@ -276,7 +299,8 @@ class SCAIL_VideoChunkIterator:
             json.dump({
                 "current_index": next_index,
                 "total_segments": total_segments,
-                "last_processed": current_index
+                "last_processed": current_index,
+                "video_fingerprint": current_fingerprint
             }, f)
 
         print(f"\n{'='*55}")
@@ -348,7 +372,16 @@ class SCAIL_DiskVideoCollector:
 
         img_np = tensor_to_numpy(generated_images)
 
-        if segment_index == 0 or not os.path.exists(manifest_path):
+        final_video_path = os.path.join(base_dir, output_filename)
+        if segment_index == 0:
+            if os.path.exists(final_video_path):
+                backup_path = os.path.join(base_dir, f"{os.path.splitext(output_filename)[0]}_prev.mp4")
+                try:
+                    shutil.copy2(final_video_path, backup_path)
+                    print(f"[SCAIL_DiskVideoCollector] Backed up previous video to {backup_path}")
+                except Exception:
+                    pass
+
             current_frame_counter = 0
             for existing_f in os.listdir(frames_dir):
                 if existing_f.endswith(".png"):
@@ -398,7 +431,6 @@ class SCAIL_DiskVideoCollector:
                 "last_segment_saved": segment_index
             }, f)
 
-        final_video_path = os.path.join(base_dir, output_filename)
         status = f"Saved segment {segment_index} ({keep_frames.shape[0]} frames). Total frames on disk: {current_frame_counter}."
         print(f"[SCAIL_DiskVideoCollector] {status}")
 
@@ -432,7 +464,24 @@ class SCAIL_DiskVideoCollector:
                     pass
 
         cached_tensor = numpy_to_tensor(overlap_frames)
-        return (cached_tensor, final_video_path, status)
+
+        # Mount HTML5 Video Player inside the ComfyUI canvas node
+        ui_payload = {}
+        if os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 1000:
+            rel_subfolder = os.path.relpath(base_dir, folder_paths.get_output_directory()).replace("\\", "/")
+            if rel_subfolder == ".":
+                rel_subfolder = ""
+            ui_payload["gifs"] = [{
+                "filename": output_filename,
+                "subfolder": rel_subfolder,
+                "type": "output",
+                "format": "video/mp4"
+            }]
+
+        return {
+            "ui": ui_payload,
+            "result": (cached_tensor, final_video_path, status)
+        }
 
 
 # =====================================================================
