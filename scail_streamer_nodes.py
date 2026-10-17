@@ -183,6 +183,11 @@ class SCAIL_VideoChunkIterator:
     FUNCTION = "iterate_chunk"
     CATEGORY = "SCAIL_Streamer"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Force ComfyUI to re-execute this node on every queue prompt
+        return float("NaN")
+
     def iterate_chunk(self, images, output_folder, frame_length, overlap_count, mode, manual_segment_index, fps=24.0, audio=None):
         total_frames = images.shape[0]
         orig_height = images.shape[1]
@@ -274,7 +279,11 @@ class SCAIL_VideoChunkIterator:
                 "last_processed": current_index
             }, f)
 
-        print(f"[SCAIL_VideoChunkIterator] Processing Segment {current_index + 1}/{total_segments} (Frames {start_frame}..{end_frame}). Is Last: {is_last_segment}")
+        print(f"\n{'='*55}")
+        print(f"🎬 [SCAIL Streamer] Segment {current_index + 1} / {total_segments}")
+        print(f"   Video frames: {total_frames} | Progress: {((current_index + 1) / total_segments) * 100:.1f}%")
+        print(f"   Frames in chunk: {start_frame} to {end_frame} | Is Last: {is_last_segment}")
+        print(f"{'='*55}\n")
 
         return (
             pose_chunk, previous_frames, current_index, total_segments,
