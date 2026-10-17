@@ -95,23 +95,32 @@ def compile_frames_to_video(frames_dir, output_mp4, fps=24.0, audio_path=None):
     input_pattern = f"{frames_dir_clean}/frame_%06d.png"
     ffmpeg_exe = get_ffmpeg_path()
 
-    ffmpeg_cmd = [
-        ffmpeg_exe, "-y",
-        "-framerate", str(fps),
-        "-i", input_pattern,
+    # 1. Start with global options
+    ffmpeg_cmd = [ffmpeg_exe, "-y"]
+
+    # 2. Add video frames input
+    ffmpeg_cmd.extend(["-framerate", str(fps), "-i", input_pattern])
+
+    # 3. Add audio input if valid (MUST come before output options)
+    has_audio = False
+    if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024:
+        audio_clean = os.path.abspath(audio_path).replace("\\", "/")
+        ffmpeg_cmd.extend(["-i", audio_clean])
+        has_audio = True
+
+    # 4. Output encoding options (strictly after all -i inputs)
+    ffmpeg_cmd.extend([
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"
-    ]
+    ])
 
-    has_audio = False
-    if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024:
-        audio_clean = os.path.abspath(audio_path).replace("\\", "/")
-        ffmpeg_cmd.extend(["-i", audio_clean, "-c:a", "aac", "-b:a", "192k", "-shortest"])
-        has_audio = True
+    if has_audio:
+        ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
 
+    # 5. Output file
     ffmpeg_cmd.append(output_mp4_clean)
 
     try:
@@ -123,35 +132,28 @@ def compile_frames_to_video(frames_dir, output_mp4, fps=24.0, audio_path=None):
         else:
             err_lines = proc.stderr.strip().splitlines()[-3:] if proc.stderr else []
             err_detail = " | ".join(err_lines)
-            print(f"[SCAIL_DiskVideoCollector] FFmpeg exited ({proc.returncode}): {err_detail}. Falling back to OpenCV...")
+            print(f"[SCAIL_DiskVideoCollector] FFmpeg error: {err_detail}. Falling back to imageio...")
     except Exception as e:
-        print(f"[SCAIL_DiskVideoCollector] FFmpeg execution issue: {e}. Falling back to OpenCV...")
+        print(f"[SCAIL_DiskVideoCollector] FFmpeg execution issue: {e}. Falling back to imageio...")
 
-    # Fallback: OpenCV VideoWriter (Runs 100% in Python, immune to Windows shell path escaping)
+    # Fallback to imageio
     frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
     if not frame_files:
         return False, "No frame PNG files found in temp_frames to compile."
 
     try:
-        first_frame = cv2.imread(frame_files[0])
-        h, w, _ = first_frame.shape
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(output_mp4, fourcc, float(fps), (w, h))
-
-        for ff in frame_files:
-            img = cv2.imread(ff)
-            if img is not None:
-                writer.write(img)
-        writer.release()
-
+        import imageio
+        with imageio.get_writer(output_mp4, fps=float(fps)) as writer:
+            for ff in frame_files:
+                writer.append_data(imageio.imread(ff))
         if os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 1000:
-            msg = f"SUCCESS! Stitched via OpenCV fallback to {output_mp4}"
+            msg = f"SUCCESS! Stitched via imageio fallback to {output_mp4}"
             print(f"[SCAIL_DiskVideoCollector] {msg}")
             return True, msg
     except Exception as e:
-        print(f"[SCAIL_DiskVideoCollector] OpenCV fallback also failed: {e}")
+        print(f"[SCAIL_DiskVideoCollector] imageio fallback also failed: {e}")
 
-    return False, "Failed to compile video with both FFmpeg and OpenCV."
+    return False, "Failed to compile video with both FFmpeg and imageio."
 
 
 # =====================================================================
